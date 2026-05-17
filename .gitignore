@@ -1,0 +1,20 @@
+# Credentials and Environment
+.env
+.env.*
+*.env
+
+# Python virtual environments
+myenv/
+env/
+venv/
+ENV/
+.venv/
+
+# Python caching and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Databases
+*.db
+*.sqlite3

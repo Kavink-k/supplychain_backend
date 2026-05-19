@@ -10,7 +10,12 @@ DATABASE_URL = DATABASE_URL.replace(
     "mysql://",
     "mysql+pymysql://"
 )
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={
+        "ssl": {}
+    }
+)
 SessionLocal = sessionmaker(autocommit=False,
     autoflush=False,
     bind=engine)

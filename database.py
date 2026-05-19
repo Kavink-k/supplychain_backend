@@ -5,10 +5,15 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
-DATABASE_URL = os.getenv('DATABASE_URL')
-
+DATABASE_URL = os.getenv("DB_URL")
+DATABASE_URL = DATABASE_URL.replace(
+    "mysql://",
+    "mysql+pymysql://"
+)
 engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+SessionLocal = sessionmaker(autocommit=False,
+    autoflush=False,
+    bind=engine)
 
 Base = declarative_base()
 

@@ -13,7 +13,7 @@ from routers import dashboard
 
 origins = [
     "http://localhost:3000",
-    # 'https://smartops-127f.onrender.com' # React frontend
+    'https://smartops-127f.onrender.com' # React frontend
 ]
 app = FastAPI()
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=True,

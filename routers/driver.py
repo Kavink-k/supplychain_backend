@@ -1,120 +1,455 @@
-# from fastapi import APIRouter, Depends
-# from sqlalchemy.orm import Session
-# import models
-# from database import get_db
-# from sqlalchemy import case
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException
+)
+from fastapi.responses import StreamingResponse
 
-# router = APIRouter()
-
-# @router.get("/{driver_id}/orders")
-# def get_driver_orders(driver_id: int, db: Session = Depends(get_db)):
-
-#     orders = db.query(models.Order).filter(
-#         models.Order.driver_id == driver_id
-#     ).order_by(
-#         case(
-#             (models.Order.priority == "HIGH", 1),
-#             (models.Order.priority == "MEDIUM", 2),
-#             (models.Order.priority == "LOW", 3),
-#         )
-#     ).all()
-
-#     return orders
-
-# @router.patch("/{order_id}/status")
-# def driver_update_status(
-#     order_id: int,
-#     status: str,
-#     db: Session = Depends(get_db)
-    
-# ):
-
-#     order = db.query(models.Order).filter(models.Order.id == order_id).first()
-
-#     if not order:
-#         return {"error": "Order not found"}
-
-#     # Driver allowed flow
-#     valid_flow = {
-#         "Packed": ["Out for Delivery"],
-#         "Out for Delivery": ["Delivered"]
-#     }
-
-#     if order.status not in valid_flow or status not in valid_flow[order.status]:
-#         return {"error": "Invalid status update"}
-
-#     order.status = status
-
-#     db.commit()
-
-#     return {"message": "Updated by driver", "status": order.status}
-
-from fastapi import APIRouter, Depends, HTTPException
-import models
-from database import get_db
 from sqlalchemy.orm import Session
-from sqlalchemy import case
+
+from typing import List
+import csv
+from io import StringIO
+
+from database import get_db
+
+import models
+import schemas
+
+from datetime import datetime
+import math
+
 from routers.auth import require_role
+
 
 router = APIRouter()
 
 
-@router.get("/my-orders")
-def get_driver_orders(db: Session = Depends(get_db),current_user: models.User = Depends(require_role("driver"))):
+# =====================================================
+# GET DRIVER ORDERS
+# =====================================================
 
-    orders = db.query(models.Order).filter(
-        models.Order.driver_id == current_user.id
-    ).order_by(
-        case(
-            (models.Order.priority == "HIGH", 1),
-            (models.Order.priority == "MEDIUM", 2),
-            (models.Order.priority == "LOW", 3),
+@router.get(
+    "/my-orders",
+    response_model=List[
+        schemas.OrderResponse
+    ]
+)
+def get_driver_orders(
+
+    db: Session = Depends(get_db),
+
+    current_user:
+        models.User = Depends(
+            require_role("driver")
         )
+):
+
+    orders = db.query(
+        models.Order
+    ).filter(
+        models.Order.driver_id
+        == current_user.id
     ).all()
 
     return orders
 
 
+# =====================================================
+# UPDATE DELIVERY STATUS
+# =====================================================
+
 @router.patch("/{order_id}/status")
-def driver_update_status(
+def update_delivery_status(
+
     order_id: int,
-    status: str,
+
+    data: schemas.UpdateStatus,
+
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(require_role("driver"))
+
+    current_user:
+        models.User = Depends(
+            require_role("driver")
+        )
 ):
 
-    order = db.query(models.Order).filter(
-        models.Order.id == order_id
+    order = db.query(
+        models.Order
+    ).filter(
+
+        models.Order.id == order_id,
+
+        models.Order.driver_id
+        == current_user.id
+
     ).first()
 
     if not order:
+
         raise HTTPException(
             status_code=404,
             detail="Order not found"
         )
 
-    if order.driver_id != current_user.id:
-        raise HTTPException(
-            status_code=403,
-            detail="Not your order"
-        )
+    # =========================================
+    # VALID STATUS FLOW
+    # =========================================
 
-    valid_flow = {
-        "Packed": ["Out for Delivery"],
-        "Out for Delivery": ["Delivered"]
-    }
+    allowed_status = [
 
-    if order.status not in valid_flow or status not in valid_flow[order.status]:
+        "DISPATCHED",
+
+        "OUT_FOR_DELIVERY",
+
+        "DELIVERED",
+
+        "FAILED",
+
+        "RETURNED",
+
+        "CUSTOMER_UNAVAILABLE"
+    ]
+
+    if data.status not in allowed_status:
+
         raise HTTPException(
             status_code=400,
-            detail="Invalid status update"
+            detail="Invalid status"
         )
 
-    order.status = status
+    # =========================================
+    # UPDATE ORDER STATUS
+    # =========================================
+
+    order.status = data.status
+
+    terminal_statuses = ["DELIVERED", "FAILED", "RETURNED", "CUSTOMER_UNAVAILABLE"]
+
+    # DELIVERY COMPLETION / TERMINAL STATE
+
+    if data.status in terminal_statuses:
+
+        is_first_terminal = order.status not in ["DELIVERED", "FAILED", "RETURNED", "CUSTOMER_UNAVAILABLE"]
+
+        if data.status == "DELIVERED":
+            order.delivered_at = datetime.utcnow()
+        else:
+            order.cancelled_at = datetime.utcnow()
+
+            # Restock inventory upon delivery failure
+            if is_first_terminal and data.status in ["FAILED", "RETURNED", "CUSTOMER_UNAVAILABLE"]:
+                for item in order.items:
+                    inventory_item = db.query(models.Inventory).filter(
+                        models.Inventory.item_name == item.item_name
+                    ).first()
+                    if inventory_item:
+                        inventory_item.quantity += item.quantity
+                        
+                        inv_log = models.InventoryLog(
+                            inventory_id=inventory_item.id,
+                            action=f"RETURNED_{data.status}",
+                            quantity=item.quantity,
+                            reference_order=order.id
+                        )
+                        db.add(inv_log)
+
+        # REDUCE DRIVER WORKLOAD
+
+        if (
+            current_user.active_deliveries
+            > 0
+        ):
+
+            current_user.active_deliveries -= 1
+
+        # AUTO AVAILABLE
+
+        if (
+            current_user.active_deliveries
+            < current_user.max_capacity
+        ):
+
+            current_user.availability = (
+                "AVAILABLE"
+            )
+
+    # DRIVER BUSY STATUS
+
+    else:
+
+        current_user.availability = (
+            "BUSY"
+        )
+
+    # =========================================
+    # TIMELINE ENTRY
+    # =========================================
+
+    timeline =models.OrderTimeline(
+
+            order_id=order.id,
+
+            status=data.status,
+
+            updated_by=current_user.name,
+
+            note=data.note
+        )
+
+    db.add(timeline)
 
     db.commit()
 
     return {
-        "message": "Updated by driver",
-        "status": order.status
+        "message":
+            "Delivery status updated",
+
+        "status":
+            order.status
     }
+
+
+# =====================================================
+# DRIVER DASHBOARD STATS
+# =====================================================
+
+@router.get("/stats")
+def driver_stats(
+
+    db: Session = Depends(get_db),
+
+    current_user:
+        models.User = Depends(
+            require_role("driver")
+        )
+):
+
+    total_orders = db.query(
+        models.Order
+    ).filter(
+        models.Order.driver_id
+        == current_user.id
+    ).count()
+
+    delivered_orders = db.query(
+        models.Order
+    ).filter(
+
+        models.Order.driver_id
+        == current_user.id,
+
+        models.Order.status
+        == "DELIVERED"
+
+    ).count()
+
+    active_orders = db.query(
+        models.Order
+    ).filter(
+
+        models.Order.driver_id
+        == current_user.id,
+
+        models.Order.status.in_([
+            "DRIVER_ASSIGNED",
+            "DISPATCHED",
+            "OUT_FOR_DELIVERY"
+        ])
+
+    ).count()
+
+    # Calculate earnings
+    completed_orders = db.query(
+        models.Order
+    ).filter(
+        models.Order.driver_id == current_user.id,
+        models.Order.status == "DELIVERED"
+    ).all()
+
+    base_pay_rate = 50
+    base_pay = len(completed_orders) * base_pay_rate
+    incentives = 0
+
+    for order in completed_orders:
+        if order.priority == "HIGH":
+            incentives += 20
+        elif order.priority == "MEDIUM":
+            incentives += 10
+        
+        if not order.is_delayed:
+            incentives += 10
+
+    total_earnings = base_pay + incentives
+
+    return {
+
+        "driver": current_user.name,
+
+        "availability":
+            current_user.availability,
+
+        "active_deliveries":
+            current_user.active_deliveries,
+
+        "max_capacity":
+            current_user.max_capacity,
+
+        "total_orders":
+            total_orders,
+
+        "delivered_orders":
+            delivered_orders,
+
+        "active_orders":
+            active_orders,
+
+        "earnings": {
+            "base_pay": base_pay,
+            "incentives": incentives,
+            "total_earnings": total_earnings,
+            "rate_per_delivery": base_pay_rate
+        }
+    }
+
+
+# =====================================================
+# GET DRIVER ORDERS OPTIMIZED (TSP Nearest Neighbor)
+# =====================================================
+
+@router.get(
+    "/my-orders/optimized",
+    response_model=List[schemas.OrderResponse]
+)
+def get_driver_orders_optimized(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("driver"))
+):
+    orders = db.query(
+        models.Order
+    ).filter(
+        models.Order.driver_id == current_user.id,
+        models.Order.status.in_(["DRIVER_ASSIGNED", "DISPATCHED", "OUT_FOR_DELIVERY"])
+    ).all()
+
+    if not orders:
+        return []
+
+    # Warehouse location: Lat 19.0760, Lng 72.8777
+    warehouse = (19.0760, 72.8777)
+    
+    def distance(p1, p2):
+        # p1, p2: (lat, lng)
+        return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+    optimized_orders = []
+    unvisited = list(orders)
+    current_loc = warehouse
+
+    while unvisited:
+        closest_order = min(
+            unvisited,
+            key=lambda o: distance(current_loc, (o.latitude if o.latitude is not None else 19.0760, o.longitude if o.longitude is not None else 72.8777))
+        )
+        unvisited.remove(closest_order)
+        optimized_orders.append(closest_order)
+        current_loc = (closest_order.latitude if closest_order.latitude is not None else 19.0760, closest_order.longitude if closest_order.longitude is not None else 72.8777)
+
+    # Append terminal orders so driver can still view their history if they look
+    other_orders = db.query(
+        models.Order
+    ).filter(
+        models.Order.driver_id == current_user.id,
+        ~models.Order.status.in_(["DRIVER_ASSIGNED", "DISPATCHED", "OUT_FOR_DELIVERY"])
+    ).all()
+
+    return optimized_orders + other_orders
+
+# =====================================================
+# GET ALL DRIVERS EARNINGS (ADMIN ONLY)
+# =====================================================
+
+@router.get("/earnings/all")
+def get_all_drivers_earnings(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("admin"))
+):
+    drivers = db.query(models.User).filter(models.User.role == "driver").all()
+    result = []
+    for d in drivers:
+        completed_orders = db.query(models.Order).filter(
+            models.Order.driver_id == d.id,
+            models.Order.status == "DELIVERED"
+        ).all()
+        
+        base_pay_rate = 50
+        base_pay = len(completed_orders) * base_pay_rate
+        incentives = 0
+        for order in completed_orders:
+            if order.priority == "HIGH":
+                incentives += 20
+            elif order.priority == "MEDIUM":
+                incentives += 10
+            
+            if not order.is_delayed:
+                incentives += 10
+                
+        total_earnings = base_pay + incentives
+        result.append({
+            "driver_id": d.id,
+            "driver_name": d.name,
+            "availability": d.availability,
+            "delivery_zone": d.delivery_zone,
+            "active_deliveries": d.active_deliveries,
+            "max_capacity": d.max_capacity,
+            "completed_deliveries": len(completed_orders),
+            "base_pay": base_pay,
+            "incentives": incentives,
+            "total_earnings": total_earnings
+        })
+    return result
+
+# =====================================================
+# EXPORT ALL DRIVERS EARNINGS TO CSV (ADMIN ONLY)
+# =====================================================
+
+@router.get("/export/csv")
+def export_drivers_csv(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("admin"))
+):
+    drivers_earnings = get_all_drivers_earnings(db=db, current_user=current_user)
+    f = StringIO()
+    writer = csv.writer(f)
+    writer.writerow([
+        "Driver ID", "Driver Name", "Availability", "Delivery Zone", 
+        "Active Deliveries", "Max Capacity", "Completed Deliveries", 
+        "Base Pay", "Incentives", "Total Earnings"
+    ])
+    for d in drivers_earnings:
+        writer.writerow([
+            d["driver_id"], d["driver_name"], d["availability"], d["delivery_zone"],
+            d["active_deliveries"], d["max_capacity"], d["completed_deliveries"],
+            d["base_pay"], d["incentives"], d["total_earnings"]
+        ])
+    f.seek(0)
+    response = StreamingResponse(f, media_type="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=drivers_earnings.csv"
+    return response
+
+# =====================================================
+# UPDATE DRIVER LOCATION (DRIVER ONLY)
+# =====================================================
+
+@router.patch("/location")
+def update_driver_location(
+    latitude: float,
+    longitude: float,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_role("driver"))
+):
+    current_user.latitude = latitude
+    current_user.longitude = longitude
+    current_user.last_active = datetime.utcnow()
+    db.commit()
+    return {"message": "Location updated successfully", "latitude": latitude, "longitude": longitude}

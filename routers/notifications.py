@@ -166,28 +166,29 @@ def generate_low_stock_alerts(
 
     db: Session = Depends(get_db)
 ):
+    try:
+        inventory = db.query(
+            models.Inventory
+        ).all()
 
-    inventory = db.query(
-        models.Inventory
-    ).all()
+        generated = 0
 
-    generated = 0
+        for item in inventory:
 
-    for item in inventory:
+            if item.quantity <= 10:
 
-        if item.quantity <= 10:
+                existing = db.query(
+                    models.Notification
+                ).filter(
 
-            existing = db.query(
-                models.Notification
-            ).filter(
+                    models.Notification.title
+                    == f"Low Stock: {item.item_name}"
 
-                models.Notification.title
-                == f"Low Stock: {item.item_name}"
+                ).first()
 
-            ).first()
-            if not existing:
+                if not existing:
 
-                notification =models.Notification(
+                    notification = models.Notification(
 
                         title=
                             f"Low Stock: {item.item_name}",
@@ -198,20 +199,23 @@ def generate_low_stock_alerts(
                         type="LOW_STOCK"
                     )
 
-                db.add(notification)
+                    db.add(notification)
 
-                generated += 1
+                    generated += 1
 
-    db.commit()
+        db.commit()
 
-    return {
+        return {
+            "message": "Low stock alerts generated",
+            "count": generated
+        }
 
-        "message":
-            "Low stock alerts generated",
-
-        "count":
-            generated
-    }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate low stock alerts: {str(e)}"
+        )
 
 
 # =====================================================
@@ -223,29 +227,29 @@ def generate_delayed_alerts(
 
     db: Session = Depends(get_db)
 ):
-
-    delayed_orders = db.query(
-        models.Order
-    ).filter(
-        models.Order.is_delayed == True
-    ).all()
-
-    generated = 0
-
-    for order in delayed_orders:
-
-        existing = db.query(
-            models.Notification
+    try:
+        delayed_orders = db.query(
+            models.Order
         ).filter(
+            models.Order.is_delayed == True
+        ).all()
 
-            models.Notification.title
-            == f"Delayed Order #{order.id}"
+        generated = 0
 
-        ).first()
+        for order in delayed_orders:
 
-        if not existing:
+            existing = db.query(
+                models.Notification
+            ).filter(
 
-            notification =models.Notification(
+                models.Notification.title
+                == f"Delayed Order #{order.id}"
+
+            ).first()
+
+            if not existing:
+
+                notification = models.Notification(
 
                     title=
                         f"Delayed Order #{order.id}",
@@ -256,16 +260,20 @@ def generate_delayed_alerts(
                     type="DELAY_ALERT"
                 )
 
-            db.add(notification)
+                db.add(notification)
 
-            generated += 1
+                generated += 1
 
-    db.commit()
+        db.commit()
 
-    return {
+        return {
+            "message": "Delayed alerts generated",
+            "count": generated
+        }
 
-        "message":
-            "Delayed alerts generated",
-        "count":
-            generated
-    }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate delayed order alerts: {str(e)}"
+        )
